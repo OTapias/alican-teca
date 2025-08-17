@@ -1,0 +1,25 @@
+# Env (secretos)
+*.env
+*.env.local
+.env.*.local
+
+# Dependencias y builds
+node_modules/
+.next/
+out/
+dist/
+
+# Logs
+npm-debug.log*
+yarn-debug.log*
+pnpm-debug.log*
+
+# SO / editor
+.DS_Store
+Thumbs.db
+.vscode/*
+!.vscode/extensions.json
+
+
+apps/web/.env.local
+apps/api/.env.local
