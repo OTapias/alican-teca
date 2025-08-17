@@ -1,0 +1,17 @@
+{
+  "name": "alican-teca",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Monorepo for the Alican‑teca e‑commerce platform. Contains the Next.js storefront (apps/web) and the Medusa backend (apps/api).",
+  "workspaces": [
+    "apps/web",
+    "apps/api"
+  ],
+  "scripts": {
+    "dev": "npm run dev:web & npm run dev:api",
+    "dev:web": "npm --prefix apps/web run dev",
+    "dev:api": "npm --prefix apps/api run dev",
+    "build:web": "npm --prefix apps/web run build",
+    "build:api": "npm --prefix apps/api run build"
+  }
+}
