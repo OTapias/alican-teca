@@ -1,0 +1,90 @@
+[
+  {
+    "id": "1",
+    "title": "Mesa de comedor rectangular",
+    "description": "Mesa robusta de teca con acabado natural y capacidad para seis personas.",
+    "price": 1500000,
+    "currency_code": "COP",
+    "images": [
+      "/placeholder.png"
+    ],
+    "category": "muebles"
+  },
+  {
+    "id": "2",
+    "title": "Bandeja decorativa",
+    "description": "Bandeja de teca ideal para servir aperitivos o decorar la mesa.",
+    "price": 120000,
+    "currency_code": "COP",
+    "images": [
+      "/placeholder.png"
+    ],
+    "category": "accesorios"
+  },
+  {
+    "id": "3",
+    "title": "Juego de cubiertos",
+    "description": "Set de cubiertos de teca tallados a mano, incluye tenedor, cuchillo y cuchara.",
+    "price": 80000,
+    "currency_code": "COP",
+    "images": [
+      "/placeholder.png"
+    ],
+    "category": "utensilios"
+  },
+  {
+    "id": "4",
+    "title": "Tabla para cortar",
+    "description": "Tabla resistente de teca perfecta para cortar y servir quesos o charcutería.",
+    "price": 95000,
+    "currency_code": "COP",
+    "images": [
+      "/placeholder.png"
+    ],
+    "category": "utensilios"
+  },
+  {
+    "id": "5",
+    "title": "Florero tallado",
+    "description": "Florero decorativo con detalles tallados a mano en madera de teca.",
+    "price": 60000,
+    "currency_code": "COP",
+    "images": [
+      "/placeholder.png"
+    ],
+    "category": "decoracion"
+  },
+  {
+    "id": "6",
+    "title": "Lámpara de mesa",
+    "description": "Lámpara de mesa con base de teca y pantalla de lino.",
+    "price": 180000,
+    "currency_code": "COP",
+    "images": [
+      "/placeholder.png"
+    ],
+    "category": "iluminacion"
+  },
+  {
+    "id": "7",
+    "title": "Cuenco rústico",
+    "description": "Cuenco artesanal ideal para ensaladas o frutas.",
+    "price": 75000,
+    "currency_code": "COP",
+    "images": [
+      "/placeholder.png"
+    ],
+    "category": "utensilios"
+  },
+  {
+    "id": "8",
+    "title": "Marco para fotografías",
+    "description": "Marco de teca con vidrio frontal, perfecto para resaltar tus fotografías favoritas.",
+    "price": 45000,
+    "currency_code": "COP",
+    "images": [
+      "/placeholder.png"
+    ],
+    "category": "decoracion"
+  }
+]

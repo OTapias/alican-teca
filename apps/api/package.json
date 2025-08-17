@@ -1,0 +1,23 @@
+{
+  "name": "alican-teca-api",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Backend API for the Alican‑teca store built with Express and designed to be compatible with Medusa.",
+  "scripts": {
+    "dev": "node src/server.js",
+    "start": "node src/server.js",
+    "build": "echo 'no build step'"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "cors": "^2.8.5",
+    "dotenv": "^10.0.0"
+    /*
+     * Nota: También puedes instalar las dependencias oficiales de Medusa
+     * (medusa, medusa-fulfillment-manual, medusa-payment-manual, etc.)
+     * para ejecutar un backend completo.  En este repositorio solo se
+     * incluye un servidor Express de referencia debido a restricciones
+     * de red en el entorno de ejemplo.
+     */
+  }
+}

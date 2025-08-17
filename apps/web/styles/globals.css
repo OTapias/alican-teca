@@ -1,0 +1,24 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Importar fuentes desde Google Fonts de forma opcional.  En producción, recomendamos descargar
+   o incrustar las fuentes para evitar llamadas externas. */
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600&family=Merriweather:wght@400;700&display=swap');
+
+html,
+body {
+  padding: 0;
+  margin: 0;
+  font-family: theme('fontFamily.sans');
+  background-color: theme('colors.teak.cream');
+}
+
+a {
+  color: inherit;
+  text-decoration: none;
+}
+
+* {
+  box-sizing: border-box;
+}
