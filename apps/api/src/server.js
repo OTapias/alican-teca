@@ -1,68 +1,102 @@
 // apps/api/src/server.js
 const express = require('express');
 const cors = require('cors');
+const morgan = require('morgan');
+const helmet = require('helmet');
+const rateLimit = require('express-rate-limit');
 const fs = require('fs');
 const path = require('path');
 const dotenv = require('dotenv');
-
-// Cargar variables de entorno desde .env.local o .env
-const envLocal = path.join(__dirname, '..', '.env.local');
-const envFile = fs.existsSync(envLocal) ? envLocal : path.join(__dirname, '..', '.env');
-dotenv.config({ path: envFile });
-
-
-// --- DB (Neon/Postgres) ---
 const { Pool } = require('pg');
 
-// Conexión a Neon si existe DATABASE_URL
-const hasDb = !!process.env.DATABASE_URL;
-let pool;
+// Cargar variables de entorno (.env.local en dev, .env en prod/local)
+const envLocal = path.join(__dirname, '..', '.env.local');
+dotenv.config({ path: fs.existsSync(envLocal) ? envLocal : path.join(__dirname, '..', '.env') });
+
+const app = express();
+const isProd = process.env.NODE_ENV === 'production';
+
+// Logs (solo en dev para no llenar los logs de Render)
+if (!isProd) app.use(morgan('dev'));
+
+// Seguridad base
+app.set('trust proxy', 1); // Render/Heroku proxy
+app.use(helmet({ crossOriginResourcePolicy: false }));
+
+// Rate limit básico (60 req/min por IP)
+app.use(rateLimit({
+  windowMs: 60 * 1000,
+  max: 60,
+  standardHeaders: true,
+  legacyHeaders: false,
+}));
+
+// --- DB (Neon/Postgres) ---
+const hasDb = Boolean(process.env.DATABASE_URL);
+let pool = null;
 if (hasDb) {
   pool = new Pool({
     connectionString: process.env.DATABASE_URL,
-    ssl: { rejectUnauthorized: false }, // necesario con Neon
+    ssl: { rejectUnauthorized: false }, // necesario con Neon gestionado
   });
 }
 
-const app = express();
+// --- CORS ---
+const ALLOW_VERCEL_WILDCARD = process.env.ALLOW_VERCEL_WILDCARD === 'true';
+const allowList = (process.env.STORE_CORS || '')
+  .split(',')
+  .map(s => s.trim())
+  .filter(Boolean);
 
-// Habilitar CORS para dominios permitidos definidos en variables de entorno
-const allowedOrigins = process.env.STORE_CORS
-  ? process.env.STORE_CORS.split(',')
-  : ['*'];
+const vercelRe = /\.vercel\.app$/i;
 
-app.use(
-  cors({
-    origin: (origin, callback) => {
-      if (!origin || allowedOrigins.indexOf('*') !== -1 || allowedOrigins.indexOf(origin) !== -1) {
-        callback(null, true);
-      } else {
-        callback(new Error('Not allowed by CORS'));
-      }
-    },
-    credentials: true,
-  })
-);
+function isAllowedOrigin(origin) {
+  if (!origin) return true; // curl / servidores sin cabecera Origin
+  if (allowList.includes('*') || allowList.includes(origin)) return true;
+
+  if (ALLOW_VERCEL_WILDCARD) {
+    try {
+      const host = new URL(origin).host;
+      if (vercelRe.test(host)) return true;
+    } catch {
+      // Origin inválido -> denegar
+    }
+  }
+  return false;
+}
+
+app.use(cors({
+  origin(origin, cb) {
+    if (isAllowedOrigin(origin)) return cb(null, true);
+    return cb(new Error(`Not allowed by CORS: ${origin ?? 'no-origin'}`));
+  },
+  credentials: false, // mantenlo en false mientras no uses cookies
+}));
 
 app.use(express.json());
 
-// Cargar productos desde el archivo JSON de seeds.
-// En una implementación real se utilizaría la API de Medusa o la BD.
+// --- Seeds como fallback ---
 const productsFile = path.join(__dirname, '..', 'seed', 'products.json');
-let products = [];
+let seedProducts = [];
 try {
-  const raw = fs.readFileSync(productsFile, 'utf8');
-  products = JSON.parse(raw);
-} catch (err) {
-  console.warn('No se pudieron cargar los productos de seed:', err.message);
+  seedProducts = JSON.parse(fs.readFileSync(productsFile, 'utf8'));
+} catch {
+  console.warn('Seed products no encontrados o JSON inválido.');
 }
 
-// Endpoints básicos
-app.get('/health', (req, res) => {
-  res.json({ status: 'ok', timestamp: new Date().toISOString() });
-});
+// --- Auth sencilla por API key (para endpoints sensibles) ---
+const API_KEY = process.env.API_KEY; // defínela en Render
+function requireApiKey(req, res, next) {
+  if (!API_KEY) return res.status(501).json({ error: 'API disabled' });
+  if (req.headers['x-api-key'] !== API_KEY) return res.status(401).json({ error: 'Unauthorized' });
+  next();
+}
 
-// Ping de base de datos (para verificar conexión a Neon)
+// --- Rutas ---
+app.get('/health', (req, res) =>
+  res.json({ status: 'ok', timestamp: new Date().toISOString() })
+);
+
 app.get('/db/ping', async (req, res) => {
   if (!hasDb) return res.status(400).json({ ok: false, error: 'DATABASE_URL not set' });
   try {
@@ -74,61 +108,62 @@ app.get('/db/ping', async (req, res) => {
   }
 });
 
-// Listado de productos (desde seed en archivo por ahora)
 app.get('/products', async (req, res) => {
   if (hasDb) {
     try {
       const { rows } = await pool.query(
-        'SELECT id, title, description, price, currency_code, image FROM products ORDER BY title'
+        'select id, title, description, price, currency_code, image from products order by title'
       );
       return res.json(rows);
-    } catch (e) {
-      console.error('[GET /products] DB error, fallback JSON:', e.message);
+    } catch (err) {
+      console.error('[GET /products] DB error -> fallback JSON:', err.message);
     }
   }
-  return res.json(products); // fallback
+  return res.json(seedProducts);
 });
 
-// Detalle de un producto
-app.get('/products/:id', (req, res) => {
-  const product = products.find((p) => p.id === req.params.id);
-  if (!product) {
-    return res.status(404).json({ message: 'Producto no encontrado' });
+app.get('/products/:id', async (req, res) => {
+  if (hasDb) {
+    try {
+      const { rows } = await pool.query(
+        'select id, title, description, price, currency_code, image from products where id=$1 limit 1',
+        [req.params.id]
+      );
+      if (rows.length) return res.json(rows[0]);
+    } catch (err) {
+      console.error('[GET /products/:id] DB error -> fallback:', err.message);
+    }
   }
-  res.json(product);
+  const p = seedProducts.find(x => x.id === req.params.id);
+  if (!p) return res.status(404).json({ message: 'Producto no encontrado' });
+  return res.json(p);
 });
 
-// Endpoint para crear una orden (simplificado)
-app.post('/orders', (req, res) => {
+// Endpoint sensible: protegido por API key
+app.post('/orders', requireApiKey, (req, res) => {
   const order = req.body;
   const id = `order_${Date.now()}`;
   console.log('Nueva orden recibida:', { id, ...order });
   res.status(201).json({ id, status: 'pending' });
 });
 
-// Webhooks de PayU
+// Webhooks (placeholders)
 app.post('/payments/payu/webhook', (req, res) => {
-  console.log('Webhook de PayU recibido:', req.body);
-  // TODO: actualizar estado de orden según notificación de PayU
+  console.log('PayU webhook:', req.body);
   res.status(200).send('OK');
 });
-
-// Webhooks de PayPal
 app.post('/payments/paypal/webhook', (req, res) => {
-  console.log('Webhook de PayPal recibido:', req.body);
-  // TODO: validar firma del webhook con PAYPAL_WEBHOOK_ID
+  console.log('PayPal webhook:', req.body);
   res.status(200).send('OK');
 });
-
-// Webhooks de BitPay
 app.post('/payments/bitpay/webhook', (req, res) => {
-  console.log('Webhook de BitPay recibido:', req.body);
-  // TODO: validar HMAC con BITPAY_WEBHOOK_SECRET
+  console.log('BitPay webhook:', req.body);
   res.status(200).send('OK');
 });
 
-// Inicio del servidor
-const PORT = process.env.PORT || 8000;
+// --- Server ---
+const PORT = Number(process.env.PORT || 8000);
 app.listen(PORT, () => {
   console.log(`Servidor API Alican-teca escuchando en puerto ${PORT}`);
+  console.log(`CORS allowList: ${allowList.join(', ') || '(empty)'}, ALLOW_VERCEL_WILDCARD=${ALLOW_VERCEL_WILDCARD}`);
 });
