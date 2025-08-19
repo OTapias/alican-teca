@@ -8,12 +8,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
   const auth = req.headers.authorization || '';
   const byHeader = auth === `Bearer ${secret}`;
 
-  const byQuery =
-    process.env.NODE_ENV !== 'production' &&
-    typeof req.query.token === 'string' &&
-    req.query.token === secret;
-
-  if (!secret || (!byHeader && !byQuery)) {
+  if (!secret || !byHeader) {
     return res.status(401).json({ ok: false, error: 'Unauthorized' });
   }
 
