@@ -1,4 +1,4 @@
-// apps/web/pages/debug-products.tsx
+import type { GetServerSideProps } from 'next';
 import Head from 'next/head';
 import { fetchProducts } from '../lib/api';
 
@@ -16,7 +16,10 @@ export default function DebugProducts({ products }: { products: any[] }) {
   );
 }
 
-export async function getServerSideProps() {
+export const getServerSideProps: GetServerSideProps = async () => {
+  if (process.env.NODE_ENV === 'production') {
+    return { notFound: true };
+  }
   const products = await fetchProducts().catch(() => []);
   return { props: { products } };
-}
+};
