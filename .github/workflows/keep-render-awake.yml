@@ -1,0 +1,29 @@
+name: Keep Render API awake
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"   # cada 10 min (UTC)
+  workflow_dispatch:         # permitir ejecutarlo manual
+
+permissions:
+  contents: read
+
+jobs:
+  ping:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Call cron endpoint (Next -> Render /health)
+        run: |
+          set -e
+          echo "Pinging https://alican-teca-web.vercel.app/api/cron ..."
+          http_code=$(curl -sS -o response.json -w "%{http_code}" \
+            https://alican-teca-web.vercel.app/api/cron \
+            -H "Authorization: Bearer $CRON_SECRET")
+          echo "HTTP $http_code"
+          cat response.json || true
+          # Falla si no es 2xx
+          test "$http_code" -ge 200 -a "$http_code" -lt 300
+    env:
+      CRON_SECRET: ${{ secrets.CRON_SECRET }}
