@@ -8,21 +8,20 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
   }
 
   try {
-    const base = process.env.NEXT_PUBLIC_API_URL; // Render API base
-    const apiKey = process.env.API_KEY_FROM_VERCEL; // SECRETO (no usar NEXT_PUBLIC)
+    const base = process.env.NEXT_PUBLIC_API_URL;     // URL pública de tu API en Render o local
+    const apiKey = process.env.API_KEY_FROM_VERCEL;   // **SECRETO** en Vercel (no NEXT_PUBLIC)
 
     if (!base || !apiKey) {
       return res.status(500).json({ error: 'Server misconfigured (API URL or key missing)' });
     }
 
-    // Cuerpo que te envía el cliente (lo reusamos)
     const payload = typeof req.body === 'string' ? JSON.parse(req.body) : req.body;
 
     const upstream = await fetch(`${base}/orders`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        'x-api-key': apiKey,             // clave que NO expones al navegador
+        'x-api-key': apiKey,
       },
       body: JSON.stringify(payload || {}),
     });

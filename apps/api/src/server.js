@@ -9,27 +9,19 @@ const path = require('path');
 const dotenv = require('dotenv');
 const { Pool } = require('pg');
 
-// Cargar variables de entorno (.env.local en dev, .env en prod/local)
+// Cargar variables (.env.local en dev; .env en prod/local)
 const envLocal = path.join(__dirname, '..', '.env.local');
 dotenv.config({ path: fs.existsSync(envLocal) ? envLocal : path.join(__dirname, '..', '.env') });
 
 const app = express();
 const isProd = process.env.NODE_ENV === 'production';
 
-// Logs (solo en dev para no llenar los logs de Render)
+// Middlewares base
 if (!isProd) app.use(morgan('dev'));
-
-// Seguridad base
 app.set('trust proxy', 1); // Render/Heroku proxy
 app.use(helmet({ crossOriginResourcePolicy: false }));
-
-// Rate limit básico (60 req/min por IP)
-app.use(rateLimit({
-  windowMs: 60 * 1000,
-  max: 60,
-  standardHeaders: true,
-  legacyHeaders: false,
-}));
+app.use(rateLimit({ windowMs: 60 * 1000, max: 60, standardHeaders: true, legacyHeaders: false }));
+app.use(express.json());
 
 // --- DB (Neon/Postgres) ---
 const hasDb = Boolean(process.env.DATABASE_URL);
@@ -37,7 +29,7 @@ let pool = null;
 if (hasDb) {
   pool = new Pool({
     connectionString: process.env.DATABASE_URL,
-    ssl: { rejectUnauthorized: false }, // necesario con Neon gestionado
+    ssl: { rejectUnauthorized: false }, // necesario en Neon gestionado
   });
 }
 
@@ -47,35 +39,29 @@ const allowList = (process.env.STORE_CORS || '')
   .split(',')
   .map(s => s.trim())
   .filter(Boolean);
-
 const vercelRe = /\.vercel\.app$/i;
 
 function isAllowedOrigin(origin) {
-  if (!origin) return true; // curl / servidores sin cabecera Origin
+  if (!origin) return true;                               // curl / servidores sin Origin
   if (allowList.includes('*') || allowList.includes(origin)) return true;
-
   if (ALLOW_VERCEL_WILDCARD) {
     try {
       const host = new URL(origin).host;
       if (vercelRe.test(host)) return true;
-    } catch {
-      // Origin inválido -> denegar
-    }
+    } catch {}
   }
   return false;
 }
+app.use(
+  cors({
+    origin(origin, cb) {
+      isAllowedOrigin(origin) ? cb(null, true) : cb(new Error(`Not allowed by CORS: ${origin ?? 'no-origin'}`));
+    },
+    credentials: false, // mantenlo en false mientras no uses cookies
+  })
+);
 
-app.use(cors({
-  origin(origin, cb) {
-    if (isAllowedOrigin(origin)) return cb(null, true);
-    return cb(new Error(`Not allowed by CORS: ${origin ?? 'no-origin'}`));
-  },
-  credentials: false, // mantenlo en false mientras no uses cookies
-}));
-
-app.use(express.json());
-
-// --- Seeds como fallback ---
+// --- Products (seed fallback) ---
 const productsFile = path.join(__dirname, '..', 'seed', 'products.json');
 let seedProducts = [];
 try {
@@ -84,20 +70,18 @@ try {
   console.warn('Seed products no encontrados o JSON inválido.');
 }
 
-// --- Auth sencilla por API key (para endpoints sensibles) ---
-const API_KEY = process.env.API_KEY; // defínela en Render
+// --- API key sencilla (para endpoints sensibles) ---
+const API_KEY = process.env.API_KEY; // DEBE estar en Render (y en local si llamas a la API local)
 function requireApiKey(req, res, next) {
   if (!API_KEY) return res.status(501).json({ error: 'API disabled' });
   if (req.headers['x-api-key'] !== API_KEY) return res.status(401).json({ error: 'Unauthorized' });
   next();
 }
 
-// --- Rutas ---
-app.get('/health', (req, res) =>
-  res.json({ status: 'ok', timestamp: new Date().toISOString() })
-);
+// ------------ RUTAS BÁSICAS ------------
+app.get('/health', (_req, res) => res.json({ status: 'ok', timestamp: new Date().toISOString() }));
 
-app.get('/db/ping', async (req, res) => {
+app.get('/db/ping', async (_req, res) => {
   if (!hasDb) return res.status(400).json({ ok: false, error: 'DATABASE_URL not set' });
   try {
     const { rows } = await pool.query('select 1 as ok');
@@ -108,7 +92,7 @@ app.get('/db/ping', async (req, res) => {
   }
 });
 
-app.get('/products', async (req, res) => {
+app.get('/products', async (_req, res) => {
   if (hasDb) {
     try {
       const { rows } = await pool.query(
@@ -139,15 +123,87 @@ app.get('/products/:id', async (req, res) => {
   return res.json(p);
 });
 
-// Endpoint sensible: protegido por API key
-app.post('/orders', requireApiKey, (req, res) => {
-  const order = req.body;
+// ------------ ÓRDENES ---------------
+
+// POST /orders  (crea orden; requiere API key)
+app.post('/orders', requireApiKey, async (req, res) => {
+  const payload = typeof req.body === 'string' ? JSON.parse(req.body) : (req.body || {});
   const id = `order_${Date.now()}`;
-  console.log('Nueva orden recibida:', { id, ...order });
-  res.status(201).json({ id, status: 'pending' });
+  const items = payload.items ?? [];
+  const amount = Number(payload.amount ?? 0);
+  const currency = String(payload.currency ?? 'COP').toUpperCase();
+  const provider = payload.provider ?? null;
+  const status = 'pending';
+
+  console.log('Nueva orden recibida:', { id, items, amount, currency });
+
+  if (hasDb) {
+    try {
+      await pool.query(
+        `insert into orders (id, items, amount, currency_code, status, provider)
+         values ($1, $2, $3, $4, $5, $6)
+         on conflict (id) do update set
+           items=excluded.items,
+           amount=excluded.amount,
+           currency_code=excluded.currency_code,
+           status=excluded.status,
+           provider=excluded.provider`,
+        [id, JSON.stringify(items), amount, currency, status, provider]
+      );
+    } catch (e) {
+      console.error('[POST /orders] insert error:', e);
+      // No bloqueamos la respuesta al front si falla la inserción; la orden igual se devuelve.
+    }
+  }
+
+  return res.status(201).json({ id, status });
 });
 
-// Webhooks (placeholders)
+// GET /orders/:id  (consulta en DB si existe)
+app.get('/orders/:id', async (req, res) => {
+  if (!hasDb) return res.status(501).json({ error: 'DB not configured' });
+
+  try {
+    const { rows } = await pool.query(
+      `select id, items, amount, currency_code, status, provider, created_at
+       from orders where id=$1 limit 1`,
+      [req.params.id]
+    );
+    if (!rows.length) return res.status(404).json({ error: 'Order not found' });
+
+    const row = rows[0];
+    // items se guardó como texto JSON: conviértelo a objeto para mostrarlo mejor
+    if (row.items && typeof row.items === 'string') {
+      try { row.items = JSON.parse(row.items); } catch {}
+    }
+
+    return res.json(row);
+  } catch (e) {
+    console.error('[GET /orders/:id] error:', e);
+    return res.status(500).json({ error: 'DB error' });
+  }
+});
+
+// GET /orders (admin: listado) — protegido con API key
+app.get('/orders', requireApiKey, async (req, res) => {
+  if (!hasDb) return res.status(501).json({ error: 'DB not configured' });
+  const limit = Math.min(Number(req.query.limit || 20), 200);
+  try {
+    const { rows } = await pool.query(
+      `select id, amount, currency_code, status, provider, created_at
+         from orders
+        order by created_at desc
+        limit $1`,
+      [limit]
+    );
+    return res.json(rows);
+  } catch (e) {
+    console.error('[GET /orders] error:', e);
+    return res.status(500).json({ error: 'DB error' });
+  }
+});
+
+// ------------ Webhooks (placeholders para pruebas) ------------
 app.post('/payments/payu/webhook', (req, res) => {
   console.log('PayU webhook:', req.body);
   res.status(200).send('OK');
@@ -161,9 +217,9 @@ app.post('/payments/bitpay/webhook', (req, res) => {
   res.status(200).send('OK');
 });
 
-// --- Server ---
+// -------------------------------------
 const PORT = Number(process.env.PORT || 8000);
 app.listen(PORT, () => {
   console.log(`Servidor API Alican-teca escuchando en puerto ${PORT}`);
-  console.log(`CORS allowList: ${allowList.join(', ') || '(empty)'}, ALLOW_VERCEL_WILDCARD=${ALLOW_VERCEL_WILDCARD}`);
+  console.log(`CORS allowList: ${allowList.join(', ') || '(empty)'}; ALLOW_VERCEL_WILDCARD=${ALLOW_VERCEL_WILDCARD}`);
 });
