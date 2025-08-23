@@ -23,3 +23,9 @@ Thumbs.db
 
 apps/web/.env.local
 apps/api/.env.local
+
+
+#Comandos para commit & push
+#git add -A 
+#git commit -m "aquí va el mensaje"
+#git push origin HEAD:main
