@@ -1,127 +1,131 @@
 // apps/web/pages/checkout.tsx
-import { useEffect, useMemo, useState } from 'react'
-import { useRouter } from 'next/router'
+import { useEffect, useMemo, useState } from 'react';
+import { useRouter } from 'next/router';
 
 type Product = {
-  id: string
-  title: string
-  price: number
-  currency_code: string
-}
+  id: string;
+  title: string;
+  description: string;
+  price: number; // asumimos en unidades (COP sin decimales)
+  currency_code: string;
+  image?: string;
+};
 
 export default function CheckoutPage() {
-  const router = useRouter()
-  const id = String(router.query.id || '')
-  const initialQty = Number(router.query.qty || 1)
+  const router = useRouter();
+  const { id, qty } = router.query as { id?: string; qty?: string };
 
-  const [product, setProduct] = useState<Product | null>(null)
-  const [qty, setQty] = useState(Math.max(1, initialQty))
-  const [creating, setCreating] = useState(false)
-  const [orderId, setOrderId] = useState<string | null>(null)
-  const [err, setErr] = useState<string | null>(null)
-
-  const amount = useMemo(() => (product ? product.price * qty : 0), [product, qty])
+  const [product, setProduct] = useState<Product | null>(null);
+  const [loading, setLoading] = useState(false);
+  const quantity = useMemo(() => Math.max(1, Number(qty || 1)), [qty]);
 
   useEffect(() => {
-    const base = process.env.NEXT_PUBLIC_API_URL!
-    if (!id) return
-    fetch(`${base}/products/${encodeURIComponent(id)}`, { cache: 'no-store' })
-      .then(r => r.json())
-      .then(setProduct)
-      .catch(() => setErr('No se pudo cargar el producto'))
-  }, [id])
+    if (!id) return;
+    const api = process.env.NEXT_PUBLIC_API_URL!;
+    fetch(`${api}/products/${id}`)
+      .then((r) => r.json())
+      .then((p) => setProduct(p))
+      .catch(() => setProduct(null));
+  }, [id]);
 
-  async function createOrder() {
-    if (!product) return
-    setCreating(true); setErr(null)
+  const total = useMemo(() => {
+    if (!product) return 0;
+    return product.price * quantity;
+  }, [product, quantity]);
+
+  async function handlePayPal() {
+    if (!product || !id) return;
     try {
-      const r = await fetch('/api/create-order', {
+      setLoading(true);
+
+      // 1) Crea orden LOCAL (en Render) vía tu API route Next (/api/create-order)
+      const r1 = await fetch('/api/create-order', {
         method: 'POST',
-        headers: {'content-type':'application/json'},
+        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          items: [{ id: product.id, qty }],
-          amount,
-          currency: product.currency_code
-        })
-      })
-      const data = await r.json()
-      if (!r.ok) throw new Error(data?.error || 'No se pudo crear la orden')
-      setOrderId(data.id)
-    } catch (e:any) {
-      setErr(e.message)
+          items: [{ id: product.id, qty: quantity }],
+          amount: total, // en unidades (p.ej. 1500000 COP -> "1500000.00" en server)
+          currency: product.currency_code || 'COP',
+        }),
+      });
+      const order = await r1.json();
+      if (!r1.ok) throw order;
+
+      // 2) Pide crear la orden PayPal y consigue la URL de aprobación
+      const origin = window.location.origin;
+      const r2 = await fetch('/api/pay/paypal/create', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          local_order_id: order.id,
+          amount: total,
+          currency: product.currency_code || 'COP',
+          return_url: `${origin}/orders/${order.id}`,
+          cancel_url: `${origin}/orders/${order.id}`,
+        }),
+      });
+      const j2 = await r2.json();
+      if (!r2.ok || !j2.approveUrl) throw j2;
+
+      // 3) Redirige a PayPal
+      window.location.href = j2.approveUrl;
+    } catch (e: any) {
+      console.error(e);
+      alert('No se pudo iniciar el pago con PayPal.');
     } finally {
-      setCreating(false)
+      setLoading(false);
     }
   }
 
-  async function simulatePay(status: 'paid'|'failed'|'cancelled', provider='test') {
-    if (!orderId) return
-    const r = await fetch('/api/pay/simulate', {
-      method: 'POST',
-      headers: {'content-type':'application/json'},
-      body: JSON.stringify({ orderId, status, provider })
-    })
-    await r.json().catch(() => ({}))
-    router.push(`/orders/${encodeURIComponent(orderId)}`)
+  if (!product) {
+    return (
+      <div className="container" style={{ padding: 24 }}>
+        Cargando…
+      </div>
+    );
   }
 
   return (
-    <main style={{ padding: 24, background: '#f5efe4', minHeight: '100vh' }}>
-      <div style={{ maxWidth: 920, margin: '0 auto', background: '#fff', padding: 24, borderRadius: 12 }}>
-        <h1>Checkout</h1>
-        {!product && <p>Cargando producto…</p>}
-        {product && (
-          <>
-            <p style={{ marginBottom: 4 }}><b>{product.title}</b></p>
-            <p style={{ marginTop: 0, color: '#666' }}>
-              Precio unitario: {product.price.toLocaleString()} {product.currency_code}
-            </p>
+    <div className="container" style={{ padding: 24 }}>
+      <div
+        style={{
+          maxWidth: 900,
+          margin: '0 auto',
+          background: '#fff',
+          borderRadius: 8,
+          padding: 24,
+          boxShadow: '0 2px 12px rgba(0,0,0,.06)',
+        }}
+      >
+        <h2>Checkout</h2>
+        <p style={{ color: '#666' }}>
+          {product.title}
+          <br />
+          <small>Precio unitario: {product.price.toLocaleString('es-CO')} {product.currency_code}</small>
+        </p>
+        <p>
+          <b>Cantidad</b> &nbsp; {quantity}
+        </p>
+        <h3>
+          Total:&nbsp; {total.toLocaleString('es-CO')} {product.currency_code}
+        </h3>
 
-            <div style={{ display: 'flex', gap: 12, alignItems: 'center', margin: '12px 0' }}>
-              <label>Cantidad</label>
-              <input
-                type="number"
-                min={1}
-                value={qty}
-                onChange={(e)=>setQty(Math.max(1, Number(e.target.value||1)))}
-                style={{ width: 80, padding: 6 }}
-              />
-            </div>
-
-            <p style={{ fontSize: 20 }}>
-              Total: <b>{amount.toLocaleString()} {product.currency_code}</b>
-            </p>
-
-            {!orderId ? (
-              <button disabled={creating} onClick={createOrder} style={btnPrimary}>
-                {creating ? 'Creando…' : 'Crear orden'}
-              </button>
-            ) : (
-              <>
-                <div style={{ marginTop: 12, padding: 12, background: '#faf7f0', borderRadius: 8 }}>
-                  Orden creada: <code>{orderId}</code>
-                </div>
-                <div style={{ display: 'flex', gap: 8, marginTop: 12 }}>
-                  <button onClick={() => simulatePay('paid', 'test')} style={btnPrimary}>Pagar (simulado)</button>
-                  <button onClick={() => simulatePay('failed', 'test')} style={btnGhost}>Fallar pago</button>
-                  <button onClick={() => simulatePay('cancelled', 'test')} style={btnGhost}>Cancelar</button>
-                </div>
-              </>
-            )}
-
-            {err && <p style={{ color: 'crimson', marginTop: 12 }}>⚠ {err}</p>}
-          </>
-        )}
+        <button
+          onClick={handlePayPal}
+          disabled={loading}
+          style={{
+            padding: '10px 16px',
+            borderRadius: 8,
+            border: 'none',
+            background: '#0070ba',
+            color: '#fff',
+            cursor: 'pointer',
+            fontWeight: 600,
+          }}
+        >
+          {loading ? 'Redirigiendo…' : 'Pagar con PayPal'}
+        </button>
       </div>
-    </main>
-  )
-}
-
-const btnPrimary: React.CSSProperties = {
-  background: '#0b8c59', color: 'white', padding: '10px 16px',
-  borderRadius: 8, border: 'none', cursor: 'pointer'
-}
-const btnGhost: React.CSSProperties = {
-  background: 'white', color: '#333', padding: '10px 16px',
-  borderRadius: 8, border: '1px solid #ddd', cursor: 'pointer'
+    </div>
+  );
 }

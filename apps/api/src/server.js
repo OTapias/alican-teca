@@ -19,10 +19,17 @@ const isProd = process.env.NODE_ENV === 'production';
 if (!isProd) app.use(morgan('dev'));
 app.set('trust proxy', 1);
 app.use(helmet({ crossOriginResourcePolicy: false }));
-app.use(rateLimit({ windowMs: 60 * 1000, max: 60, standardHeaders: true, legacyHeaders: false }));
+app.use(
+  rateLimit({
+    windowMs: 60 * 1000,
+    max: 60,
+    standardHeaders: true,
+    legacyHeaders: false,
+  })
+);
 app.use(express.json());
 
-// --- DB (Neon/Postgres) ---
+// --- DB (Neon/Postgres) opcional ---
 const hasDb = Boolean(process.env.DATABASE_URL);
 let pool = null;
 if (hasDb) {
@@ -36,7 +43,7 @@ if (hasDb) {
 const ALLOW_VERCEL_WILDCARD = process.env.ALLOW_VERCEL_WILDCARD === 'true';
 const allowList = (process.env.STORE_CORS || '')
   .split(',')
-  .map(s => s.trim())
+  .map((s) => s.trim())
   .filter(Boolean);
 
 const vercelRe = /\.vercel\.app$/i;
@@ -51,56 +58,67 @@ function isAllowedOrigin(origin) {
   }
   return false;
 }
-app.use(cors({
-  origin(origin, cb) { isAllowedOrigin(origin) ? cb(null, true) : cb(new Error(`Not allowed by CORS: ${origin ?? 'no-origin'}`)); },
-  credentials: false,
-}));
+app.use(
+  cors({
+    origin(origin, cb) {
+      isAllowedOrigin(origin)
+        ? cb(null, true)
+        : cb(new Error(`Not allowed by CORS: ${origin ?? 'no-origin'}`));
+    },
+    credentials: false,
+  })
+);
 
-// --- Seeds de productos (fallback) ---
+// --- Seeds de productos como fallback ---
 const productsFile = path.join(__dirname, '..', 'seed', 'products.json');
 let seedProducts = [];
-try { seedProducts = JSON.parse(fs.readFileSync(productsFile, 'utf8')); }
-catch { console.warn('Seed products no encontrados o JSON inválido.'); }
+try {
+  seedProducts = JSON.parse(fs.readFileSync(productsFile, 'utf8'));
+} catch {
+  console.warn('Seed products no encontrados o JSON inválido.');
+}
 
 // --- API key sencilla (para endpoints sensibles) ---
-const API_KEY = process.env.API_KEY; // DEBE estar en Render
+const API_KEY = process.env.API_KEY; // defínela en Render
 function requireApiKey(req, res, next) {
   if (!API_KEY) return res.status(501).json({ error: 'API disabled' });
   if (req.headers['x-api-key'] !== API_KEY) return res.status(401).json({ error: 'Unauthorized' });
   next();
 }
 
-// ---- helpers de órdenes ----
-const ALLOWED_STATUSES = new Set(['pending', 'authorized', 'paid', 'failed', 'cancelled', 'refunded']);
+// =====================
+//      PAYPAL
+// =====================
+const PAYPAL_ENV = process.env.PAYPAL_ENV || 'sandbox'; // 'sandbox' | 'live'
+const PAYPAL_CLIENT_ID = process.env.PAYPAL_CLIENT_ID || '';
+const PAYPAL_SECRET = process.env.PAYPAL_SECRET || '';
+const PAYPAL_CURRENCY_OVERRIDE = (process.env.PAYPAL_CURRENCY_OVERRIDE || '').toUpperCase(); // opcional
+const paypalBase =
+  PAYPAL_ENV === 'live' ? 'https://api-m.paypal.com' : 'https://api-m.sandbox.paypal.com';
 
-async function updateOrder({ id, status, provider }) {
-  if (!hasDb) throw new Error('DB not configured');
-  const fields = [];
-  const values = [];
-  let idx = 1;
-
-  if (status) {
-    if (!ALLOWED_STATUSES.has(status)) throw new Error('Invalid status');
-    fields.push(`status = $${idx++}`);
-    values.push(status);
-  }
-  if (provider !== undefined) {
-    fields.push(`provider = $${idx++}`);
-    values.push(provider);
-  }
-  if (!fields.length) return null;
-
-  values.push(id);
-  const sql = `update orders set ${fields.join(', ')} where id=$${idx} returning id, items, amount, currency_code, status, provider, created_at`;
-  const { rows } = await pool.query(sql, values);
-  return rows[0] || null;
+async function paypalAccessToken() {
+  const creds = Buffer.from(`${PAYPAL_CLIENT_ID}:${PAYPAL_SECRET}`).toString('base64');
+  const r = await fetch(`${paypalBase}/v1/oauth2/token`, {
+    method: 'POST',
+    headers: {
+      Authorization: `Basic ${creds}`,
+      'Content-Type': 'application/x-www-form-urlencoded',
+    },
+    body: 'grant_type=client_credentials',
+  });
+  if (!r.ok) throw new Error(`[paypalAccessToken] ${r.status}`);
+  const j = await r.json();
+  return j.access_token;
 }
 
-// ------------ RUTAS BÁSICAS ------------
-app.get('/health', (req, res) =>
-  res.json({ status: 'ok', timestamp: new Date().toISOString() })
-);
+// =====================
+//      RUTAS
+// =====================
 
+// Salud
+app.get('/health', (req, res) => res.json({ status: 'ok', timestamp: new Date().toISOString() }));
+
+// DB ping
 app.get('/db/ping', async (req, res) => {
   if (!hasDb) return res.status(400).json({ ok: false, error: 'DATABASE_URL not set' });
   try {
@@ -139,16 +157,18 @@ app.get('/products/:id', async (req, res) => {
       console.error('[GET /products/:id] DB error -> fallback:', err.message);
     }
   }
-  const p = seedProducts.find(x => x.id === req.params.id);
+  const p = seedProducts.find((x) => x.id === req.params.id);
   if (!p) return res.status(404).json({ message: 'Producto no encontrado' });
   return res.json(p);
 });
 
-// ------------ ÓRDENES ---------------
+// ---------------------
+//        ÓRDENES
+// ---------------------
 
-// POST /orders (crea orden; requiere API key)
+// Crea orden local (backend privado; tu Next la invoca con x-api-key desde /api/create-order)
 app.post('/orders', requireApiKey, async (req, res) => {
-  const payload = typeof req.body === 'string' ? JSON.parse(req.body) : (req.body || {});
+  const payload = typeof req.body === 'string' ? JSON.parse(req.body) : req.body || {};
   const id = `order_${Date.now()}`;
   const items = payload.items ?? [];
   const amount = Number(payload.amount ?? 0);
@@ -174,27 +194,13 @@ app.post('/orders', requireApiKey, async (req, res) => {
   return res.status(201).json({ id, status });
 });
 
-// GET /orders (lista admin; requiere API key)
-app.get('/orders', requireApiKey, async (req, res) => {
-  if (!hasDb) return res.status(501).json({ error: 'DB not configured' });
-  const limit = Math.min(Number(req.query.limit || 50), 200);
-  const { rows } = await pool.query(
-    `select id, amount, currency_code, status, provider, created_at
-     from orders order by created_at desc limit $1`,
-    [limit]
-  );
-  res.json(rows);
-});
-
-// GET /orders/:id
+// Consulta orden pública (por id)
 app.get('/orders/:id', async (req, res) => {
-  const id = req.params.id;
   if (!hasDb) return res.status(501).json({ error: 'DB not configured' });
-
   try {
     const { rows } = await pool.query(
       'select id, items, amount, currency_code, status, provider, created_at from orders where id=$1 limit 1',
-      [id]
+      [req.params.id]
     );
     if (!rows.length) return res.status(404).json({ error: 'Order not found' });
     return res.json(rows[0]);
@@ -204,54 +210,188 @@ app.get('/orders/:id', async (req, res) => {
   }
 });
 
-// PATCH /orders/:id  (actualiza estado/proveedor; requiere API key)
+// Listado admin
+app.get('/orders', requireApiKey, async (req, res) => {
+  if (!hasDb) return res.status(501).json({ error: 'DB not configured' });
+  const limit = Math.max(1, Math.min(50, Number(req.query.limit || 20)));
+  try {
+    const { rows } = await pool.query(
+      `select id, amount, currency_code, status, provider, created_at 
+       from orders order by created_at desc limit $1`,
+      [limit]
+    );
+    return res.json(rows);
+  } catch (e) {
+    console.error('[GET /orders] error:', e);
+    return res.status(500).json({ error: 'DB error' });
+  }
+});
+
+// Actualiza estado (admin)
 app.patch('/orders/:id', requireApiKey, async (req, res) => {
+  if (!hasDb) return res.status(501).json({ error: 'DB not configured' });
+  const id = req.params.id;
+  const { status, provider } = req.body || {};
   try {
-    const updated = await updateOrder({
-      id: req.params.id,
-      status: req.body?.status,
-      provider: req.body?.provider,
-    });
-    if (!updated) return res.status(400).json({ error: 'Nothing to update' });
-    res.json(updated);
+    const { rowCount } = await pool.query(
+      `update orders set 
+          status = coalesce($2, status),
+          provider = coalesce($3, provider)
+        where id=$1`,
+      [id, status, provider]
+    );
+    if (!rowCount) return res.status(404).json({ error: 'Order not found' });
+    return res.json({ ok: true });
   } catch (e) {
-    console.error('[PATCH /orders/:id] error:', e.message);
-    res.status(400).json({ error: e.message });
+    console.error('[PATCH /orders/:id] error:', e);
+    return res.status(500).json({ error: 'DB error' });
   }
 });
 
-// ---- Webhooks (actualizan si llega order_id + status) ----
-async function tryUpdateFromWebhook(body, providerName) {
+// ---------------------
+//     PAYMENTS: PayPal
+// ---------------------
+
+// Crea orden en PayPal y devuelve la URL de aprobación
+// body: { local_order_id, amount, currency, return_url, cancel_url }
+app.post('/payments/paypal/create-order', async (req, res) => {
   try {
-    const orderId = body?.order_id || body?.orderId || body?.order || body?.data?.order_id;
-    const status  = body?.status || body?.data?.status;
-    if (orderId && status) {
-      await updateOrder({ id: orderId, status: String(status).toLowerCase(), provider: providerName });
+    const { local_order_id, amount, currency, return_url, cancel_url } = req.body || {};
+    if (!local_order_id || !amount) {
+      return res.status(400).json({ error: 'Missing local_order_id or amount' });
     }
+
+    const currencyToUse =
+      PAYPAL_CURRENCY_OVERRIDE || (currency || 'USD').toUpperCase();
+
+    const token = await paypalAccessToken();
+
+    // IMPORTANTE: asumimos que "amount" llega en unidades (no centavos).
+    // Si tuvieras centavos, usar: const value = (Number(amount) / 100).toFixed(2)
+    const value = Number(amount).toFixed(2);
+
+    const r = await fetch(`${paypalBase}/v2/checkout/orders`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${token}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        intent: 'CAPTURE',
+        purchase_units: [
+          {
+            amount: { currency_code: currencyToUse, value },
+            custom_id: local_order_id, // para atar el webhook a tu orden local
+          },
+        ],
+        application_context: {
+          return_url,
+          cancel_url,
+        },
+      }),
+    });
+
+    const data = await r.json();
+    if (!r.ok) {
+      console.error('[paypal create-order] error:', data);
+      return res.status(400).json({ error: 'paypal_create_order_failed', details: data });
+    }
+
+    const approve = (data.links || []).find((l) => l.rel === 'approve');
+    return res.json({ paypal_order_id: data.id, approveUrl: approve?.href || null });
   } catch (e) {
-    console.error(`[webhook:${providerName}] update error:`, e.message);
+    console.error(e);
+    return res.status(500).json({ error: 'server_error' });
   }
-}
-
-app.post('/payments/payu/webhook', async (req, res) => {
-  console.log('PayU webhook:', req.body);
-  await tryUpdateFromWebhook(req.body, 'payu');
-  res.status(200).send('OK');
 });
+
+// Webhook PayPal: captura y actualiza la orden local
 app.post('/payments/paypal/webhook', async (req, res) => {
-  console.log('PayPal webhook:', req.body);
-  await tryUpdateFromWebhook(req.body, 'paypal');
+  try {
+    const event = req.body;
+
+    // Nota: en producción deberías validar la firma con VERIFY_WEBHOOK_SIGNATURE.
+    // Aquí nos centramos en el flujo.
+
+    if (event.event_type === 'CHECKOUT.ORDER.APPROVED') {
+      const paypalOrderId = event.resource?.id;
+      const localId = event.resource?.purchase_units?.[0]?.custom_id;
+
+      const token = await paypalAccessToken();
+      const r = await fetch(`${paypalBase}/v2/checkout/orders/${paypalOrderId}/capture`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({}),
+      });
+      const capture = await r.json();
+
+      if (r.ok) {
+        if (hasDb && localId) {
+          try {
+            await pool.query(
+              "update orders set status='paid', provider='paypal' where id=$1",
+              [localId]
+            );
+          } catch (dbErr) {
+            console.error('[webhook] DB update error:', dbErr);
+          }
+        }
+      } else {
+        console.error('[paypal capture error]', capture);
+        if (hasDb && localId) {
+          await pool.query(
+            "update orders set status='failed', provider='paypal' where id=$1",
+            [localId]
+          );
+        }
+      }
+    }
+
+    if (event.event_type === 'PAYMENT.CAPTURE.DENIED') {
+      const localId =
+        event.resource?.custom_id ||
+        event.resource?.supplementary_data?.related_ids?.order_id;
+      if (hasDb && localId) {
+        await pool.query(
+          "update orders set status='failed', provider='paypal' where id=$1",
+          [localId]
+        );
+      }
+    }
+
+    if (event.event_type === 'PAYMENT.CAPTURE.COMPLETED') {
+      const localId = event.resource?.custom_id;
+      if (hasDb && localId) {
+        await pool.query(
+          "update orders set status='paid', provider='paypal' where id=$1",
+          [localId]
+        );
+      }
+    }
+
+    return res.status(200).send('OK');
+  } catch (e) {
+    console.error('[paypal webhook] error:', e);
+    // devolver 200 para que PayPal no reintente indefinidamente
+    return res.status(200).send('OK');
+  }
+});
+
+// Otros webhooks (placeholders)
+app.post('/payments/payu/webhook', (req, res) => {
+  console.log('PayU webhook:', req.body);
   res.status(200).send('OK');
 });
-app.post('/payments/bitpay/webhook', async (req, res) => {
+app.post('/payments/bitpay/webhook', (req, res) => {
   console.log('BitPay webhook:', req.body);
-  await tryUpdateFromWebhook(req.body, 'bitpay');
   res.status(200).send('OK');
 });
 
-// -------------------------------------
+// --- Server ---
 const PORT = Number(process.env.PORT || 8000);
 app.listen(PORT, () => {
   console.log(`Servidor API Alican-teca escuchando en puerto ${PORT}`);
-  console.log(`CORS allowList: ${allowList.join(', ') || '(empty)'}; ALLOW_VERCEL_WILDCARD=${ALLOW_VERCEL_WILDCARD}`);
+  console.log(
+    `CORS allowList: ${allowList.join(', ') || '(empty)'}; ALLOW_VERCEL_WILDCARD=${ALLOW_VERCEL_WILDCARD}`
+  );
 });
