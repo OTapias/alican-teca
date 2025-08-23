@@ -19,14 +19,12 @@ const isProd = process.env.NODE_ENV === 'production';
 if (!isProd) app.use(morgan('dev'));
 app.set('trust proxy', 1);
 app.use(helmet({ crossOriginResourcePolicy: false }));
-app.use(
-  rateLimit({
-    windowMs: 60 * 1000,
-    max: 60,
-    standardHeaders: true,
-    legacyHeaders: false,
-  })
-);
+app.use(rateLimit({
+  windowMs: 60 * 1000,
+  max: 60,
+  standardHeaders: true,
+  legacyHeaders: false,
+}));
 app.use(express.json());
 
 // --- DB (Neon/Postgres) opcional ---
@@ -58,16 +56,14 @@ function isAllowedOrigin(origin) {
   }
   return false;
 }
-app.use(
-  cors({
-    origin(origin, cb) {
-      isAllowedOrigin(origin)
-        ? cb(null, true)
-        : cb(new Error(`Not allowed by CORS: ${origin ?? 'no-origin'}`));
-    },
-    credentials: false,
-  })
-);
+app.use(cors({
+  origin(origin, cb) {
+    isAllowedOrigin(origin)
+      ? cb(null, true)
+      : cb(new Error(`Not allowed by CORS: ${origin ?? 'no-origin'}`));
+  },
+  credentials: false,
+}));
 
 // --- Seeds de productos como fallback ---
 const productsFile = path.join(__dirname, '..', 'seed', 'products.json');
@@ -93,8 +89,9 @@ const PAYPAL_ENV = process.env.PAYPAL_ENV || 'sandbox'; // 'sandbox' | 'live'
 const PAYPAL_CLIENT_ID = process.env.PAYPAL_CLIENT_ID || '';
 const PAYPAL_SECRET = process.env.PAYPAL_SECRET || '';
 const PAYPAL_CURRENCY_OVERRIDE = (process.env.PAYPAL_CURRENCY_OVERRIDE || '').toUpperCase(); // opcional
-const paypalBase =
-  PAYPAL_ENV === 'live' ? 'https://api-m.paypal.com' : 'https://api-m.sandbox.paypal.com';
+const paypalBase = PAYPAL_ENV === 'live'
+  ? 'https://api-m.paypal.com'
+  : 'https://api-m.sandbox.paypal.com';
 
 async function paypalAccessToken() {
   const creds = Buffer.from(`${PAYPAL_CLIENT_ID}:${PAYPAL_SECRET}`).toString('base64');
@@ -112,14 +109,14 @@ async function paypalAccessToken() {
 }
 
 // =====================
-//      RUTAS
+//        RUTAS
 // =====================
 
 // Salud
-app.get('/health', (req, res) => res.json({ status: 'ok', timestamp: new Date().toISOString() }));
+app.get('/health', (_req, res) => res.json({ status: 'ok', timestamp: new Date().toISOString() }));
 
 // DB ping
-app.get('/db/ping', async (req, res) => {
+app.get('/db/ping', async (_req, res) => {
   if (!hasDb) return res.status(400).json({ ok: false, error: 'DATABASE_URL not set' });
   try {
     const { rows } = await pool.query('select 1 as ok');
@@ -252,6 +249,31 @@ app.patch('/orders/:id', requireApiKey, async (req, res) => {
 //     PAYMENTS: PayPal
 // ---------------------
 
+// Helpers para crear orden en PayPal con posible fallback a USD
+async function createOrderOnPaypal({ local_order_id, amount, currency_code, return_url, cancel_url }) {
+  const token = await paypalAccessToken();
+  const value = Number(amount).toFixed(2);
+  const r = await fetch(`${paypalBase}/v2/checkout/orders`, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${token}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      intent: 'CAPTURE',
+      purchase_units: [
+        {
+          amount: { currency_code, value },
+          custom_id: local_order_id,
+        },
+      ],
+      application_context: { return_url, cancel_url },
+    }),
+  });
+  const data = await r.json();
+  return { ok: r.ok, status: r.status, data };
+}
+
 // Crea orden en PayPal y devuelve la URL de aprobación
 // body: { local_order_id, amount, currency, return_url, cancel_url }
 app.post('/payments/paypal/create-order', async (req, res) => {
@@ -261,44 +283,50 @@ app.post('/payments/paypal/create-order', async (req, res) => {
       return res.status(400).json({ error: 'Missing local_order_id or amount' });
     }
 
-    const currencyToUse =
-      PAYPAL_CURRENCY_OVERRIDE || (currency || 'USD').toUpperCase();
+    // Moneda preferida (variable de entorno tiene prioridad)
+    const preferred = (PAYPAL_CURRENCY_OVERRIDE || currency || 'USD').toUpperCase();
 
-    const token = await paypalAccessToken();
-
-    // IMPORTANTE: asumimos que "amount" llega en unidades (no centavos).
-    // Si tuvieras centavos, usar: const value = (Number(amount) / 100).toFixed(2)
-    const value = Number(amount).toFixed(2);
-
-    const r = await fetch(`${paypalBase}/v2/checkout/orders`, {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${token}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        intent: 'CAPTURE',
-        purchase_units: [
-          {
-            amount: { currency_code: currencyToUse, value },
-            custom_id: local_order_id, // para atar el webhook a tu orden local
-          },
-        ],
-        application_context: {
-          return_url,
-          cancel_url,
-        },
-      }),
+    // Intento #1 con la moneda preferida
+    let attempt = await createOrderOnPaypal({
+      local_order_id,
+      amount,
+      currency_code: preferred,
+      return_url,
+      cancel_url,
     });
 
-    const data = await r.json();
-    if (!r.ok) {
-      console.error('[paypal create-order] error:', data);
-      return res.status(400).json({ error: 'paypal_create_order_failed', details: data });
+    // Si falla por tema de moneda, reintenta en USD (salvo que ya sea USD)
+    const name = attempt?.data?.name || attempt?.data?.details?.[0]?.issue || '';
+    const currencyError =
+      !attempt.ok &&
+      /CURRENCY|UNSUPPORTED|NOT_ENABLED|VALID_CURRENCY/i.test(`${name} ${JSON.stringify(attempt.data)}`);
+
+    if (!attempt.ok && preferred !== 'USD' && currencyError) {
+      console.warn('[paypal create-order] moneda no soportada, reintento en USD:', {
+        preferred,
+        reason: name,
+      });
+      attempt = await createOrderOnPaypal({
+        local_order_id,
+        amount,
+        currency_code: 'USD',
+        return_url,
+        cancel_url,
+      });
     }
 
-    const approve = (data.links || []).find((l) => l.rel === 'approve');
-    return res.json({ paypal_order_id: data.id, approveUrl: approve?.href || null });
+    if (!attempt.ok) {
+      console.error('[paypal create-order] fallo', {
+        status: attempt.status,
+        response: attempt.data,
+      });
+      return res
+        .status(400)
+        .json({ error: 'paypal_create_order_failed', details: attempt.data, triedCurrency: preferred });
+    }
+
+    const approve = (attempt.data.links || []).find((l) => l.rel === 'approve');
+    return res.json({ paypal_order_id: attempt.data.id, approveUrl: approve?.href || null });
   } catch (e) {
     console.error(e);
     return res.status(500).json({ error: 'server_error' });
@@ -310,8 +338,7 @@ app.post('/payments/paypal/webhook', async (req, res) => {
   try {
     const event = req.body;
 
-    // Nota: en producción deberías validar la firma con VERIFY_WEBHOOK_SIGNATURE.
-    // Aquí nos centramos en el flujo.
+    // (En producción: validar firma con VERIFY_WEBHOOK_SIGNATURE)
 
     if (event.event_type === 'CHECKOUT.ORDER.APPROVED') {
       const paypalOrderId = event.resource?.id;
@@ -391,7 +418,5 @@ app.post('/payments/bitpay/webhook', (req, res) => {
 const PORT = Number(process.env.PORT || 8000);
 app.listen(PORT, () => {
   console.log(`Servidor API Alican-teca escuchando en puerto ${PORT}`);
-  console.log(
-    `CORS allowList: ${allowList.join(', ') || '(empty)'}; ALLOW_VERCEL_WILDCARD=${ALLOW_VERCEL_WILDCARD}`
-  );
+  console.log(`CORS allowList: ${allowList.join(', ') || '(empty)'}; ALLOW_VERCEL_WILDCARD=${ALLOW_VERCEL_WILDCARD}`);
 });

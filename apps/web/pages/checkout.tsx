@@ -51,6 +51,7 @@ export default function CheckoutPage() {
       const order = await r1.json();
       if (!r1.ok) throw order;
 
+
       // 2) Pide crear la orden PayPal y consigue la URL de aprobación
       const origin = window.location.origin;
       const r2 = await fetch('/api/pay/paypal/create', {
@@ -64,8 +65,13 @@ export default function CheckoutPage() {
           cancel_url: `${origin}/orders/${order.id}`,
         }),
       });
+
       const j2 = await r2.json();
-      if (!r2.ok || !j2.approveUrl) throw j2;
+      if (!r2.ok || !j2.approveUrl) {
+        console.error('PayPal create error:', j2);
+        throw j2;
+      }
+
 
       // 3) Redirige a PayPal
       window.location.href = j2.approveUrl;
