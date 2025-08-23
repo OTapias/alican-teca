@@ -56,7 +56,7 @@ app.use(cors({
   credentials: false,
 }));
 
-// --- Products (seed fallback) ---
+// --- Seeds de productos (fallback) ---
 const productsFile = path.join(__dirname, '..', 'seed', 'products.json');
 let seedProducts = [];
 try { seedProducts = JSON.parse(fs.readFileSync(productsFile, 'utf8')); }
@@ -70,58 +70,38 @@ function requireApiKey(req, res, next) {
   next();
 }
 
-// ------------ Helpers ÓRDENES ------------
-const ALLOWED_STATUSES = new Set(['pending', 'paid', 'failed', 'canceled', 'refunded']);
+// ---- helpers de órdenes ----
+const ALLOWED_STATUSES = new Set(['pending', 'authorized', 'paid', 'failed', 'cancelled', 'refunded']);
 
-/** Normaliza/valida status desconocidos */
-function normStatus(s, fallback = 'pending') {
-  if (!s) return fallback;
-  const v = String(s).toLowerCase();
-  return ALLOWED_STATUSES.has(v) ? v : fallback;
-}
+async function updateOrder({ id, status, provider }) {
+  if (!hasDb) throw new Error('DB not configured');
+  const fields = [];
+  const values = [];
+  let idx = 1;
 
-/** Actualiza una orden con campos sueltos */
-async function updateOrder(id, fields) {
-  if (!hasDb) return;
-  if (!id || !fields || !Object.keys(fields).length) return;
-
-  const cols = [];
-  const vals = [];
-  let i = 1;
-  for (const [k, v] of Object.entries(fields)) {
-    cols.push(`${k} = $${i++}`);
-    vals.push(v);
+  if (status) {
+    if (!ALLOWED_STATUSES.has(status)) throw new Error('Invalid status');
+    fields.push(`status = $${idx++}`);
+    values.push(status);
   }
-  vals.push(id);
-  const sql = `update orders set ${cols.join(', ')} where id = $${i}`;
-  await pool.query(sql, vals);
-}
+  if (provider !== undefined) {
+    fields.push(`provider = $${idx++}`);
+    values.push(provider);
+  }
+  if (!fields.length) return null;
 
-/** Extrae {id, status} de un webhook por proveedor (placeholder simple). */
-function parseWebhook(provider, body = {}) {
-  // Aquí irán las extracciones reales de cada gateway.
-  // Por ahora intentamos varias claves comunes y ponemos defaults.
-  const id =
-    body.orderId ||
-    body.referenceCode ||
-    body.reference ||
-    body.merchant_order_id ||
-    body.id ||
-    null;
-
-  // Mapeos muy básicos de ejemplo:
-  let status = body.status || body.state || body.state_pol || body.transaction_status || 'paid';
-  status = normStatus(status, 'paid');
-
-  return { id, status, provider };
+  values.push(id);
+  const sql = `update orders set ${fields.join(', ')} where id=$${idx} returning id, items, amount, currency_code, status, provider, created_at`;
+  const { rows } = await pool.query(sql, values);
+  return rows[0] || null;
 }
 
 // ------------ RUTAS BÁSICAS ------------
-app.get('/health', (_req, res) =>
+app.get('/health', (req, res) =>
   res.json({ status: 'ok', timestamp: new Date().toISOString() })
 );
 
-app.get('/db/ping', async (_req, res) => {
+app.get('/db/ping', async (req, res) => {
   if (!hasDb) return res.status(400).json({ ok: false, error: 'DATABASE_URL not set' });
   try {
     const { rows } = await pool.query('select 1 as ok');
@@ -132,6 +112,7 @@ app.get('/db/ping', async (_req, res) => {
   }
 });
 
+// Productos
 app.get('/products', async (_req, res) => {
   if (hasDb) {
     try {
@@ -165,7 +146,7 @@ app.get('/products/:id', async (req, res) => {
 
 // ------------ ÓRDENES ---------------
 
-// POST /orders  (crea orden; requiere API key)
+// POST /orders (crea orden; requiere API key)
 app.post('/orders', requireApiKey, async (req, res) => {
   const payload = typeof req.body === 'string' ? JSON.parse(req.body) : (req.body || {});
   const id = `order_${Date.now()}`;
@@ -193,7 +174,19 @@ app.post('/orders', requireApiKey, async (req, res) => {
   return res.status(201).json({ id, status });
 });
 
-// GET /orders/:id  (consulta en DB si existe)
+// GET /orders (lista admin; requiere API key)
+app.get('/orders', requireApiKey, async (req, res) => {
+  if (!hasDb) return res.status(501).json({ error: 'DB not configured' });
+  const limit = Math.min(Number(req.query.limit || 50), 200);
+  const { rows } = await pool.query(
+    `select id, amount, currency_code, status, provider, created_at
+     from orders order by created_at desc limit $1`,
+    [limit]
+  );
+  res.json(rows);
+});
+
+// GET /orders/:id
 app.get('/orders/:id', async (req, res) => {
   const id = req.params.id;
   if (!hasDb) return res.status(501).json({ error: 'DB not configured' });
@@ -211,64 +204,49 @@ app.get('/orders/:id', async (req, res) => {
   }
 });
 
-// GET /orders?limit=20  (listado admin; requiere x-api-key)
-app.get('/orders', requireApiKey, async (req, res) => {
-  const limit = Math.max(1, Math.min(200, Number(req.query.limit ?? 20)));
-  if (!hasDb) return res.status(501).json({ error: 'DB not configured' });
-
+// PATCH /orders/:id  (actualiza estado/proveedor; requiere API key)
+app.patch('/orders/:id', requireApiKey, async (req, res) => {
   try {
-    const { rows } = await pool.query(
-      `select id, amount, currency_code, status, provider, created_at
-       from orders
-       order by created_at desc
-       limit $1`,
-      [limit]
-    );
-    return res.json(rows);
+    const updated = await updateOrder({
+      id: req.params.id,
+      status: req.body?.status,
+      provider: req.body?.provider,
+    });
+    if (!updated) return res.status(400).json({ error: 'Nothing to update' });
+    res.json(updated);
   } catch (e) {
-    console.error('[GET /orders] error:', e);
-    return res.status(500).json({ error: 'DB error' });
+    console.error('[PATCH /orders/:id] error:', e.message);
+    res.status(400).json({ error: e.message });
   }
 });
 
-// ------------ WEBHOOKS (placeholders útiles) ------------
-// IMPORTANTE: aquí todavía no verificamos firmas; eso se añade
-// al integrar la pasarela real. Por ahora sirven para actualizar estado.
+// ---- Webhooks (actualizan si llega order_id + status) ----
+async function tryUpdateFromWebhook(body, providerName) {
+  try {
+    const orderId = body?.order_id || body?.orderId || body?.order || body?.data?.order_id;
+    const status  = body?.status || body?.data?.status;
+    if (orderId && status) {
+      await updateOrder({ id: orderId, status: String(status).toLowerCase(), provider: providerName });
+    }
+  } catch (e) {
+    console.error(`[webhook:${providerName}] update error:`, e.message);
+  }
+}
 
 app.post('/payments/payu/webhook', async (req, res) => {
-  try {
-    const { id, status, provider } = parseWebhook('payu', req.body);
-    if (!id) return res.status(400).send('missing order id');
-    await updateOrder(id, { status, provider });
-    return res.status(200).send('OK');
-  } catch (e) {
-    console.error('[payu webhook] error:', e);
-    return res.status(500).send('ERR');
-  }
+  console.log('PayU webhook:', req.body);
+  await tryUpdateFromWebhook(req.body, 'payu');
+  res.status(200).send('OK');
 });
-
 app.post('/payments/paypal/webhook', async (req, res) => {
-  try {
-    const { id, status, provider } = parseWebhook('paypal', req.body);
-    if (!id) return res.status(400).send('missing order id');
-    await updateOrder(id, { status, provider });
-    return res.status(200).send('OK');
-  } catch (e) {
-    console.error('[paypal webhook] error:', e);
-    return res.status(500).send('ERR');
-  }
+  console.log('PayPal webhook:', req.body);
+  await tryUpdateFromWebhook(req.body, 'paypal');
+  res.status(200).send('OK');
 });
-
 app.post('/payments/bitpay/webhook', async (req, res) => {
-  try {
-    const { id, status, provider } = parseWebhook('bitpay', req.body);
-    if (!id) return res.status(400).send('missing order id');
-    await updateOrder(id, { status, provider });
-    return res.status(200).send('OK');
-  } catch (e) {
-    console.error('[bitpay webhook] error:', e);
-    return res.status(500).send('ERR');
-  }
+  console.log('BitPay webhook:', req.body);
+  await tryUpdateFromWebhook(req.body, 'bitpay');
+  res.status(200).send('OK');
 });
 
 // -------------------------------------

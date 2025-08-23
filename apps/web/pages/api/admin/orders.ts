@@ -1,25 +1,52 @@
 // apps/web/pages/api/admin/orders.ts
 import type { NextApiRequest, NextApiResponse } from 'next';
 
+const BASE = process.env.NEXT_PUBLIC_API_URL!;            // https://alican-teca-api.onrender.com
+const ADMIN_KEY = process.env.API_KEY_FROM_VERCEL!;       // secreto
+
 export default async function handler(req: NextApiRequest, res: NextApiResponse) {
-  if (req.method !== 'GET') {
-    res.setHeader('Allow', 'GET');
-    return res.status(405).json({ error: 'Method not allowed' });
+  if (!BASE || !ADMIN_KEY) {
+    return res.status(500).json({ error: 'Server misconfigured' });
   }
 
+  const headers: Record<string, string> = {
+    'x-api-key': ADMIN_KEY,
+    'content-type': 'application/json',
+  };
+
   try {
-    const base = process.env.NEXT_PUBLIC_API_URL;       // Render API base
-    const apiKey = process.env.API_KEY_FROM_VERCEL;     // SECRETO (no exponer)
-    if (!base || !apiKey) return res.status(500).json({ error: 'Server misconfigured' });
+    // GET /api/admin/orders?limit=...
+    if (req.method === 'GET' && !req.query.id) {
+      const limit = String(req.query.limit ?? '50');
+      const upstream = await fetch(`${BASE}/orders?limit=${encodeURIComponent(limit)}`, { headers, cache: 'no-store' });
+      const data = await upstream.json();
+      return res.status(upstream.status).json(data);
+    }
 
-    const limit = Number(req.query.limit ?? 20);
-    const upstream = await fetch(`${base}/orders?limit=${encodeURIComponent(String(limit))}`, {
-      headers: { 'x-api-key': apiKey },
-      cache: 'no-store',
-    });
+    // GET /api/admin/orders?id=...
+    if (req.method === 'GET' && req.query.id) {
+      const id = String(req.query.id);
+      const upstream = await fetch(`${BASE}/orders/${encodeURIComponent(id)}`, { headers, cache: 'no-store' });
+      const data = await upstream.json();
+      return res.status(upstream.status).json(data);
+    }
 
-    const data = await upstream.json().catch(() => ({}));
-    return res.status(upstream.status).json(data);
+    // PATCH /api/admin/orders?id=...   body: { status?, provider? }
+    if (req.method === 'PATCH') {
+      const id = String(req.query.id || '');
+      if (!id) return res.status(400).json({ error: 'Missing id' });
+
+      const upstream = await fetch(`${BASE}/orders/${encodeURIComponent(id)}`, {
+        method: 'PATCH',
+        headers,
+        body: JSON.stringify(typeof req.body === 'string' ? JSON.parse(req.body) : req.body),
+      });
+      const data = await upstream.json().catch(() => ({}));
+      return res.status(upstream.status).json(data);
+    }
+
+    res.setHeader('Allow', 'GET,PATCH');
+    return res.status(405).json({ error: 'Method not allowed' });
   } catch (err: any) {
     console.error('[api/admin/orders] error:', err?.message || err);
     return res.status(500).json({ error: 'Internal error' });
