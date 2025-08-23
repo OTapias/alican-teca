@@ -16,9 +16,8 @@ dotenv.config({ path: fs.existsSync(envLocal) ? envLocal : path.join(__dirname, 
 const app = express();
 const isProd = process.env.NODE_ENV === 'production';
 
-// Middlewares base
 if (!isProd) app.use(morgan('dev'));
-app.set('trust proxy', 1); // Render/Heroku proxy
+app.set('trust proxy', 1);
 app.use(helmet({ crossOriginResourcePolicy: false }));
 app.use(rateLimit({ windowMs: 60 * 1000, max: 60, standardHeaders: true, legacyHeaders: false }));
 app.use(express.json());
@@ -29,7 +28,7 @@ let pool = null;
 if (hasDb) {
   pool = new Pool({
     connectionString: process.env.DATABASE_URL,
-    ssl: { rejectUnauthorized: false }, // necesario en Neon gestionado
+    ssl: { rejectUnauthorized: false },
   });
 }
 
@@ -39,10 +38,10 @@ const allowList = (process.env.STORE_CORS || '')
   .split(',')
   .map(s => s.trim())
   .filter(Boolean);
-const vercelRe = /\.vercel\.app$/i;
 
+const vercelRe = /\.vercel\.app$/i;
 function isAllowedOrigin(origin) {
-  if (!origin) return true;                               // curl / servidores sin Origin
+  if (!origin) return true;
   if (allowList.includes('*') || allowList.includes(origin)) return true;
   if (ALLOW_VERCEL_WILDCARD) {
     try {
@@ -52,34 +51,75 @@ function isAllowedOrigin(origin) {
   }
   return false;
 }
-app.use(
-  cors({
-    origin(origin, cb) {
-      isAllowedOrigin(origin) ? cb(null, true) : cb(new Error(`Not allowed by CORS: ${origin ?? 'no-origin'}`));
-    },
-    credentials: false, // mantenlo en false mientras no uses cookies
-  })
-);
+app.use(cors({
+  origin(origin, cb) { isAllowedOrigin(origin) ? cb(null, true) : cb(new Error(`Not allowed by CORS: ${origin ?? 'no-origin'}`)); },
+  credentials: false,
+}));
 
 // --- Products (seed fallback) ---
 const productsFile = path.join(__dirname, '..', 'seed', 'products.json');
 let seedProducts = [];
-try {
-  seedProducts = JSON.parse(fs.readFileSync(productsFile, 'utf8'));
-} catch {
-  console.warn('Seed products no encontrados o JSON inválido.');
-}
+try { seedProducts = JSON.parse(fs.readFileSync(productsFile, 'utf8')); }
+catch { console.warn('Seed products no encontrados o JSON inválido.'); }
 
 // --- API key sencilla (para endpoints sensibles) ---
-const API_KEY = process.env.API_KEY; // DEBE estar en Render (y en local si llamas a la API local)
+const API_KEY = process.env.API_KEY; // DEBE estar en Render
 function requireApiKey(req, res, next) {
   if (!API_KEY) return res.status(501).json({ error: 'API disabled' });
   if (req.headers['x-api-key'] !== API_KEY) return res.status(401).json({ error: 'Unauthorized' });
   next();
 }
 
+// ------------ Helpers ÓRDENES ------------
+const ALLOWED_STATUSES = new Set(['pending', 'paid', 'failed', 'canceled', 'refunded']);
+
+/** Normaliza/valida status desconocidos */
+function normStatus(s, fallback = 'pending') {
+  if (!s) return fallback;
+  const v = String(s).toLowerCase();
+  return ALLOWED_STATUSES.has(v) ? v : fallback;
+}
+
+/** Actualiza una orden con campos sueltos */
+async function updateOrder(id, fields) {
+  if (!hasDb) return;
+  if (!id || !fields || !Object.keys(fields).length) return;
+
+  const cols = [];
+  const vals = [];
+  let i = 1;
+  for (const [k, v] of Object.entries(fields)) {
+    cols.push(`${k} = $${i++}`);
+    vals.push(v);
+  }
+  vals.push(id);
+  const sql = `update orders set ${cols.join(', ')} where id = $${i}`;
+  await pool.query(sql, vals);
+}
+
+/** Extrae {id, status} de un webhook por proveedor (placeholder simple). */
+function parseWebhook(provider, body = {}) {
+  // Aquí irán las extracciones reales de cada gateway.
+  // Por ahora intentamos varias claves comunes y ponemos defaults.
+  const id =
+    body.orderId ||
+    body.referenceCode ||
+    body.reference ||
+    body.merchant_order_id ||
+    body.id ||
+    null;
+
+  // Mapeos muy básicos de ejemplo:
+  let status = body.status || body.state || body.state_pol || body.transaction_status || 'paid';
+  status = normStatus(status, 'paid');
+
+  return { id, status, provider };
+}
+
 // ------------ RUTAS BÁSICAS ------------
-app.get('/health', (_req, res) => res.json({ status: 'ok', timestamp: new Date().toISOString() }));
+app.get('/health', (_req, res) =>
+  res.json({ status: 'ok', timestamp: new Date().toISOString() })
+);
 
 app.get('/db/ping', async (_req, res) => {
   if (!hasDb) return res.status(400).json({ ok: false, error: 'DATABASE_URL not set' });
@@ -131,7 +171,7 @@ app.post('/orders', requireApiKey, async (req, res) => {
   const id = `order_${Date.now()}`;
   const items = payload.items ?? [];
   const amount = Number(payload.amount ?? 0);
-  const currency = String(payload.currency ?? 'COP').toUpperCase();
+  const currency = (payload.currency ?? 'COP').toUpperCase();
   const provider = payload.provider ?? null;
   const status = 'pending';
 
@@ -142,17 +182,11 @@ app.post('/orders', requireApiKey, async (req, res) => {
       await pool.query(
         `insert into orders (id, items, amount, currency_code, status, provider)
          values ($1, $2, $3, $4, $5, $6)
-         on conflict (id) do update set
-           items=excluded.items,
-           amount=excluded.amount,
-           currency_code=excluded.currency_code,
-           status=excluded.status,
-           provider=excluded.provider`,
+         on conflict (id) do nothing`,
         [id, JSON.stringify(items), amount, currency, status, provider]
       );
     } catch (e) {
       console.error('[POST /orders] insert error:', e);
-      // No bloqueamos la respuesta al front si falla la inserción; la orden igual se devuelve.
     }
   }
 
@@ -161,39 +195,33 @@ app.post('/orders', requireApiKey, async (req, res) => {
 
 // GET /orders/:id  (consulta en DB si existe)
 app.get('/orders/:id', async (req, res) => {
+  const id = req.params.id;
   if (!hasDb) return res.status(501).json({ error: 'DB not configured' });
 
   try {
     const { rows } = await pool.query(
-      `select id, items, amount, currency_code, status, provider, created_at
-       from orders where id=$1 limit 1`,
-      [req.params.id]
+      'select id, items, amount, currency_code, status, provider, created_at from orders where id=$1 limit 1',
+      [id]
     );
     if (!rows.length) return res.status(404).json({ error: 'Order not found' });
-
-    const row = rows[0];
-    // items se guardó como texto JSON: conviértelo a objeto para mostrarlo mejor
-    if (row.items && typeof row.items === 'string') {
-      try { row.items = JSON.parse(row.items); } catch {}
-    }
-
-    return res.json(row);
+    return res.json(rows[0]);
   } catch (e) {
     console.error('[GET /orders/:id] error:', e);
     return res.status(500).json({ error: 'DB error' });
   }
 });
 
-// GET /orders (admin: listado) — protegido con API key
+// GET /orders?limit=20  (listado admin; requiere x-api-key)
 app.get('/orders', requireApiKey, async (req, res) => {
+  const limit = Math.max(1, Math.min(200, Number(req.query.limit ?? 20)));
   if (!hasDb) return res.status(501).json({ error: 'DB not configured' });
-  const limit = Math.min(Number(req.query.limit || 20), 200);
+
   try {
     const { rows } = await pool.query(
       `select id, amount, currency_code, status, provider, created_at
-         from orders
-        order by created_at desc
-        limit $1`,
+       from orders
+       order by created_at desc
+       limit $1`,
       [limit]
     );
     return res.json(rows);
@@ -203,18 +231,44 @@ app.get('/orders', requireApiKey, async (req, res) => {
   }
 });
 
-// ------------ Webhooks (placeholders para pruebas) ------------
-app.post('/payments/payu/webhook', (req, res) => {
-  console.log('PayU webhook:', req.body);
-  res.status(200).send('OK');
+// ------------ WEBHOOKS (placeholders útiles) ------------
+// IMPORTANTE: aquí todavía no verificamos firmas; eso se añade
+// al integrar la pasarela real. Por ahora sirven para actualizar estado.
+
+app.post('/payments/payu/webhook', async (req, res) => {
+  try {
+    const { id, status, provider } = parseWebhook('payu', req.body);
+    if (!id) return res.status(400).send('missing order id');
+    await updateOrder(id, { status, provider });
+    return res.status(200).send('OK');
+  } catch (e) {
+    console.error('[payu webhook] error:', e);
+    return res.status(500).send('ERR');
+  }
 });
-app.post('/payments/paypal/webhook', (req, res) => {
-  console.log('PayPal webhook:', req.body);
-  res.status(200).send('OK');
+
+app.post('/payments/paypal/webhook', async (req, res) => {
+  try {
+    const { id, status, provider } = parseWebhook('paypal', req.body);
+    if (!id) return res.status(400).send('missing order id');
+    await updateOrder(id, { status, provider });
+    return res.status(200).send('OK');
+  } catch (e) {
+    console.error('[paypal webhook] error:', e);
+    return res.status(500).send('ERR');
+  }
 });
-app.post('/payments/bitpay/webhook', (req, res) => {
-  console.log('BitPay webhook:', req.body);
-  res.status(200).send('OK');
+
+app.post('/payments/bitpay/webhook', async (req, res) => {
+  try {
+    const { id, status, provider } = parseWebhook('bitpay', req.body);
+    if (!id) return res.status(400).send('missing order id');
+    await updateOrder(id, { status, provider });
+    return res.status(200).send('OK');
+  } catch (e) {
+    console.error('[bitpay webhook] error:', e);
+    return res.status(500).send('ERR');
+  }
 });
 
 // -------------------------------------
